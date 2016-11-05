@@ -4,6 +4,25 @@ program SmartImageDisk;
 
 {$R *.res}
 
+// terminal connection settings, zero size problem, always busy problem
+// http://atola.com/products/insight/manual/seagate-7200.11.html
+// https://sites.google.com/site/seagatefix/
+
+// https://www.itosaka.com/WordPress/wp-content/uploads/2009/07/Seagate-Diagnostic-Command.pdf
+
+// all codes
+// http://www.hddserialcommander.com/seagate/
+// https://forum.hddguru.com/viewtopic.php?t=6411
+
+// http://www.overclock.net/t/457286/seagate-bricked-firmware-drive-fix-with-pics/40
+// http://s3.eurecom.fr/~zaddach/docs/POC13_zaddach.pdf
+
+// LED errors, new heads..
+// http://forum.acelaboratory.com/viewtopic.php?t=8453
+
+// how to connect to master/slave pins with photo
+// http://elabz.com/repairning-seagate-7200-11-drive-on-a-ubuntu-success-story/
+
 uses
   WinApi.Windows,
   System.Math,
@@ -12,9 +31,15 @@ uses
   System.SysUtils;
 
 const
-  INVALID_SET_FILE_POINTER: Integer = -1;
-
   BlockGrowFactor = 4;
+
+  dtOneDay = 1;
+  dtOneHour = dtOneDay/24;
+  dtOneMinute = dtOneHour/60;
+  dtOneSecond = dtOneMinute/60;
+  dtOneMilliSecond = dtOneSecond/1000;
+
+  MaxSaveRangesDelta = 5*dtOneMinute; // every 5 minutes
 
 type
   TSTORAGE_PROPERTY_ID = (
@@ -148,10 +173,16 @@ begin
   CloseFile(logFile);
 end;
 
+procedure LogFileOnlyWriteLn(const aLine: string);
+begin
+  WriteLn(logFile, aLine);
+  Flush(logFile);
+end;
+
 procedure LogWriteLn(const aLine: string);
 begin
   // write to log
-  WriteLn(logFile, FormatDateTime('yyyy-mm-dd hh:nn:ss', Now)+' '+aLine);
+  LogFileOnlyWriteLn(FormatDateTime('yyyy-mm-dd hh:nn:ss', Now)+' '+aLine);
   // write to console
   WriteLn(aLine);
 end;
@@ -227,6 +258,14 @@ begin
   then Result := -1;
 end;
 
+function MySysErrorMessage(): string;
+var
+  le: DWORD;
+begin
+  le := GetLastError;
+  Result := le.tostring+': '+SysErrorMessage(le);
+end;
+
 function GetDiskSectorSize(aDiskHandle: THandle): Integer;
 var
   storageQuery: TSTORAGE_PROPERTY_QUERY;
@@ -243,23 +282,27 @@ begin
   else Result := -1;
 end;
 
-function CopyBlock(aDiskHandle: THandle; aOutputFile: TFileStream; aPosition: Int64; aBlockSize: DWORD; var aBuffer): Boolean;
+function CopyBlock(aDiskHandle, aOutputFile: THandle; {aOutputFile: TFileStream; }aPosition: Int64; aBlockSize: DWORD; var aBuffer): Boolean;
 var
   res: DWORD;
 begin
   // todo: switch to direct sector reading?
   // http://www.codeproject.com/Articles/28314/Reading-and-Writing-to-Raw-Disk-Sectors
 
-
   if SetFilePointerEx(aDiskHandle, aPosition, nil, FILE_BEGIN) and ReadFile(aDiskHandle, aBuffer, aBlockSize, res, nil) then
   begin
+    Result :=
+      SetFilePointerEx(aOutputFile, aPosition, nil, FILE_BEGIN) and
+      WriteFile(aOutputFile, aBuffer, aBlockSize, res, nil);
+    {
     aOutputFile.Position := aPosition;
     res := aOutputFile.Write(aBuffer, res);
     Result := res=aBlockSize;
+    }
 	end
   else
   begin
-    LogWriteLn('## CopyBlock @ '+aPosition.ToString+': '+SysErrorMessage(GetLastError));
+    LogWriteLn('## CopyBlock @ '+aPosition.ToString+' - '+BytesToStr(aBlockSize)+' : '+MySysErrorMessage);
     Result := False;
   end;
 end;
@@ -280,10 +323,115 @@ begin
   end;
   // status to console only
   Write(
-    aRanges[aCurrentRange].head.ToString+'/'+aRanges[aCurrentRange].tail.ToString+'/'+BytesToStr(aRanges[aCurrentRange].size)+' - '+BytesToStr(aBlockSize)+' '+
-    BytesToStr(toProcess)+'/'+Round(100*toProcess/aDiskSize).ToString+'% '+
-    belowMinRangeCount.ToString+'/'+aRanges.Count.ToString+
+    aRanges[aCurrentRange].head.ToString+'/'+aRanges[aCurrentRange].tail.ToString+'/'+BytesToStr(aRanges[aCurrentRange].size)+' - '+BytesToStr(aBlockSize)+' - '+
+    BytesToStr(toProcess)+' ('+Round(100*toProcess/aDiskSize).ToString+'%) - '+
+    belowMinRangeCount.ToString+'/'+aRanges.Count.ToString+'        '+
     #13);
+end;
+
+procedure LoadRanges(aRanges: TRanges; const aRangesFileName: string);
+var
+  rangesFile: File;
+  currentRange: TRange;
+  res: Integer;
+begin
+  AssignFile(rangesFile, aRangesFileName);
+  Reset(rangesFile, 1);
+  try
+    while not EOF(rangesFile) do
+    begin
+      BlockRead(rangesFile, currentRange, SizeOf(currentRange), res);
+      if res=SizeOf(currentRange)
+      then aRanges.Add(currentRange)
+      else
+      begin
+        LogWriteLn('## Error reading progress file..');
+        ReadLn;
+        Halt;
+      end;
+    end;
+  finally
+    CloseFile(rangesFile);
+  end;
+end;
+
+procedure SaveRanges(aRanges: TRanges; const aRangesFileName: string);
+var
+  rangesFile: File;
+  currentRange: TRange;
+begin
+  // store ranges
+  AssignFile(rangesFile, aRangesFileName);
+  Rewrite(rangesFile, 1);
+  try
+    for currentRange in aRanges
+    do BlockWrite(rangesFile, currentRange, SizeOf(currentRange));
+  finally
+    CloseFile(rangesFile);
+  end;
+end;
+
+procedure LogRanges(aRanges: TRanges);
+var
+  currentRange: TRange;
+begin
+  for currentRange in aRanges
+  do LogWriteLn('   '+
+       currentRange.head.ToString()+' ('+Ord(currentRange.scanHead).ToString+') - '+
+       currentRange.tail.ToString()+' ('+Ord(currentRange.scanTail).ToString+') : '+
+       BytesToStr(currentRange.size));
+end;
+
+var
+  ranges: TRanges;
+  rangesFileName: string;
+  //outputFile: TFileStream;
+  outputFile: THandle;
+  done: Boolean;
+
+procedure FlushAll;
+begin
+  done := True;
+  //FlushFileBuffers(outputFile.Handle);
+  FlushFileBuffers(outputFile);
+  SaveRanges(ranges, rangesFileName);
+end;
+
+function ConsoleCtrlHandler(dwCtrlType: DWORD): Boolean; stdcall;
+begin
+  Result := False; // execute default handler
+  case dwCtrlType of
+    CTRL_CLOSE_EVENT:
+      begin
+        FlushAll;
+        WriteLn;
+        LogWriteLn('Done on close event');
+      end;
+    CTRL_LOGOFF_EVENT:
+      begin
+        FlushAll;
+        WriteLn;
+        LogWriteLn('Done on logoff event');
+      end;
+    CTRL_SHUTDOWN_EVENT:
+      begin
+        FlushAll;
+        WriteLn;
+        LogWriteLn('Done on shutdown event');
+      end;
+    CTRL_C_EVENT:
+      begin
+        FlushAll;
+        WriteLn;
+        LogWriteLn('Done on ctrl-c event');
+      end;
+    CTRL_BREAK_EVENT:
+      begin
+        FlushAll;
+        WriteLn;
+        LogWriteLn('Done on ctrl-break event');
+      end;
+  end;
 end;
 
 procedure CopyDiskToImage(const aDiskPath, aOutputFileName, aProgressFileName: string; aMinRangeSize: Int64);
@@ -293,21 +441,24 @@ var
   outputFileOK: Boolean;
   outputFileSize: Int64;
   sectorSize: Integer;
-  ranges: TRanges;
-  rangesFile: File;
-  done: Boolean;
   r: Integer;
-  res: Integer;
   lowRange: TRange;
   highRange: TRange;
   blockSize: Int64;
-  outputFile: TFileStream;
   maxBlockSize: Integer;
   buffer: RawByteString;
   currentRange: TRange;
+  lastSavedRanges: TDateTime;
 begin
   // open disk as file
-  diskHandle := CreateFile(PChar(aDiskPath), GENERIC_READ, FILE_SHARE_READ or FILE_SHARE_WRITE, nil, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+  diskHandle := CreateFile(
+    PChar(aDiskPath), GENERIC_READ,
+    FILE_SHARE_READ or FILE_SHARE_WRITE,
+    nil,
+    OPEN_EXISTING,
+    FILE_ATTRIBUTE_NORMAL or FILE_FLAG_NO_BUFFERING,
+    0);
+  // FILE_FLAG_NO_BUFFERING ?
   if diskHandle<>INVALID_HANDLE_VALUE then
   begin
     try
@@ -343,25 +494,9 @@ begin
               if FileExists(aProgressFileName) then
               begin
                 // read progress file and start from there
-                AssignFile(rangesFile, aProgressFileName);
-                Reset(rangesFile, 1);
-                try
-                  while not EOF(rangesFile) do
-                  begin
-                    BlockRead(rangesFile, currentRange, SizeOf(currentRange), res);
-                    if res=SizeOf(currentRange)
-                    then ranges.Add(currentRange)
-                    else
-                    begin
-                      LogWriteLn('## Error reading progress file..');
-                      ReadLn;
-                      Halt;
-                    end;
-                  end;
-                finally
-                  CloseFile(rangesFile);
-                end;
+                LoadRanges(ranges, aProgressFileName);
                 LogWriteLn('Read '+ranges.Count.ToString()+' ranges to process');
+                LogRanges(ranges);
               end
               else
               begin
@@ -374,126 +509,151 @@ begin
                 LogWriteLn('Added whole disk as first range');
               end;
 
-              outputFile := TFileStream.Create(aOutputFileName, fmOpenReadWrite);
+              //outputFile := TFileStream.Create(aOutputFileName, fmOpenReadWrite);
+              outputFile := CreateFile(
+    					  PChar(aOutputFileName), GENERIC_WRITE,
+                FILE_SHARE_READ or FILE_SHARE_WRITE,
+                nil,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL{ or FILE_FLAG_NO_BUFFERING},
+                0);
               try
                 // prepare buffer
-                maxBlockSize := 1024*1024*64;
+                maxBlockSize := 64*1024; // 256*sectorSize; //*1024; // 256*4kB sectors or 2048*512B sectors
                 setLength(buffer, maxBlockSize);
                 // process defined ranges
                 done := False;
-                while (ranges.Count>0) and not done do
-                begin
-                  // find first range to process
-                  r := 0;
-                  while (r<ranges.Count) and (ranges[r].size<aMinRangeSize)
-                  do r := r+1;
-                  if r<ranges.Count then
+                lastSavedRanges := 0; // never saved ranges
+                rangesFileName := aProgressFileName;
+                // make sure that if console window is closed or ctrl-break or ctrl-c is pressed we exit nicely
+        				SetConsoleCtrlHandler(@ConsoleCtrlHandler, True);
+                try
+                  while (ranges.Count>0) and not done do
                   begin
-                    // process range
-                    // try to advance head
-                    blockSize := sectorSize;
-                    while (ranges[r].size>0) and ranges[r].scanHead do
+                    // find first range to process
+                    r := 0;
+                    while (r<ranges.Count) and (ranges[r].size<aMinRangeSize)
+                    do r := r+1;
+                    if r<ranges.Count then
                     begin
-                      blockSize := min(min(blockSize, ranges[r].size), maxBlockSize);
-                      ShowStatus(diskSize, ranges, r, aMinRangeSize, blockSize);
-                      if CopyBlock(diskHandle, outputFile, ranges[r].head, blockSize, buffer[1]) then
-                      begin
-                        currentRange := ranges[r];
-                        currentRange.head := currentRange.head+blockSize;
-                        ranges[r] := currentRange;
-                        blockSize := blockSize*BlockGrowFactor;
-                      end
-                      else
-                      begin
-                        if blockSize>sectorSize
-                        then blockSize := sectorSize // reset block size
-                        else
+                      // process range
+                      try
+                        // try to advance head
+                        blockSize := sectorSize;
+                        while (ranges[r].size>0) and ranges[r].scanHead do
                         begin
-                          currentRange := ranges[r];
-                          currentRange.scanHead := False; //  signal we are ready
-                          ranges[r] := currentRange;
+                          blockSize := min(min(blockSize, ranges[r].size), maxBlockSize);
+                          ShowStatus(diskSize, ranges, r, aMinRangeSize, blockSize);
+                          if CopyBlock(diskHandle, outputFile, ranges[r].head, blockSize, buffer[1]) then
+                          begin
+                            currentRange := ranges[r];
+                            currentRange.head := currentRange.head+blockSize;
+                            ranges[r] := currentRange;
+                            blockSize := blockSize*BlockGrowFactor;
+                          end
+                          else
+                          begin
+                            if blockSize>sectorSize
+                            then blockSize := sectorSize // reset block size
+                            else
+                            begin
+                              currentRange := ranges[r];
+                              currentRange.scanHead := False; //  signal we are ready
+                              ranges[r] := currentRange;
+                            end;
+                          end;
+                        end;
+                        // try to decrease tail
+                        blockSize := sectorSize;
+                        while (ranges[r].size>0) and ranges[r].scanTail do
+                        begin
+                          blockSize := min(min(blockSize, ranges[r].size), maxBlockSize);
+                          ShowStatus(diskSize, ranges, r, aMinRangeSize, blockSize);
+                          if CopyBlock(diskHandle, outputFile, ranges[r].tail-blockSize+1, blockSize, buffer[1]) then
+                          begin
+                            currentRange := ranges[r];
+                            currentRange.tail := currentRange.tail-blockSize;
+                            ranges[r] := currentRange;
+                            blockSize := blockSize*BlockGrowFactor;
+                          end
+                          else
+                          begin
+                            if blockSize>sectorSize
+                            then blockSize := sectorSize // reset block size
+                            else
+                            begin
+                              currentRange := ranges[r];
+                              currentRange.scanTail := False; //  signal we are ready
+                              ranges[r] := currentRange;
+                            end;
+                          end;
+                        end;
+                      except
+                        on E: Exception do
+                        begin
+                          LogWriteLn('## Exception in copy range: '+E.Message);
+                          done := True;
                         end;
                       end;
-                    end;
-                    // try to decrease tail
-                    blockSize := sectorSize;
-                    while (ranges[r].size>0) and ranges[r].scanTail do
-                    begin
-                      blockSize := min(min(blockSize, ranges[r].size), maxBlockSize);
-                      ShowStatus(diskSize, ranges, r, aMinRangeSize, blockSize);
-                      if CopyBlock(diskHandle, outputFile, ranges[r].tail-blockSize+1, blockSize, buffer[1]) then
+                      // range is minimized now
+                      if ranges[r].size>0 then
                       begin
-                        currentRange := ranges[r];
-                        currentRange.tail := currentRange.tail-blockSize;
-                        ranges[r] := currentRange;
-                        blockSize := blockSize*BlockGrowFactor;
-                      end
-                      else
-                      begin
-                        if blockSize>sectorSize
-                        then blockSize := sectorSize // reset block size
-                        else
-                        begin
-                          currentRange := ranges[r];
-                          currentRange.scanTail := False; //  signal we are ready
-                          ranges[r] := currentRange;
-                        end;
+                        // split up range
+                        lowRange.head := ranges[r].head;
+                        lowRange.scanHead := ranges[r].scanHead;
+                        lowRange.tail := ranges[r].middle(sectorSize)-1;
+                        lowRange.scanTail := True;
+                        highRange.head := ranges[r].middle(sectorSize);
+                        highRange.scanHead := True;
+                        highRange.tail := ranges[r].tail;
+                        highRange.scanTail := ranges[r].scanTail;
+                        // add split entries to end of queue
+                        ranges.Add(lowRange);
+                        ranges.Add(highRange);
                       end;
-                    end;
-                    // range is minimized now
-                    if ranges[r].size>0 then
+                      // remove this entry
+                      ranges.Delete(r);
+                    end
+                    else done := True;
+
+                    if lastSavedRanges<=Now-MaxSaveRangesDelta then
                     begin
-                      // split up range
-                      lowRange.head := ranges[r].head;
-                      lowRange.scanHead := ranges[r].scanHead;
-                      lowRange.tail := ranges[r].middle(sectorSize)-1;
-                      lowRange.scanTail := True;
-                      highRange.head := ranges[r].middle(sectorSize);
-                      highRange.scanHead := True;
-                      highRange.tail := ranges[r].tail;
-                      highRange.scanTail := ranges[r].scanTail;
-                      // add split entries to end of queue
-                      ranges.Add(lowRange);
-                      ranges.Add(highRange);
+                      SaveRanges(ranges, aProgressFileName);
+                      lastSavedRanges := Now;
                     end;
-                    // remove this entry
-                    ranges.Delete(r);
-                  end
-                  else done := True;
+
+                  end;
+                finally
+                  SetConsoleCtrlHandler(@ConsoleCtrlHandler, False);
                 end;
 
               finally
-                outputFile.Free;
+                //outputFile.Free;
+                CloseHandle(outputFile);
               end;
 
               WriteLn; // to skip progress line
 
-              // store ranges
-              AssignFile(rangesFile, aProgressFileName);
-              Rewrite(rangesFile, 1);
-              try
-                for currentRange in ranges do
-                begin
-                  BlockWrite(rangesFile, currentRange, SizeOf(currentRange));
-                end;
-              finally
-                CloseFile(rangesFile);
-              end;
+              SaveRanges(ranges, aProgressFileName);
 
               LogWriteLn('Saved '+ranges.Count.ToString()+' ranges');
+
+              for currentRange in ranges
+              do LogFileOnlyWriteLn(currentRange.head.ToString+#9+currentRange.tail.ToString+#9+BytesToStr(currentRange.size));
+
             finally
               ranges.Free;
             end;
           end;
         end
-        else LogWriteLn('## Could not get disk sector size: '+SysErrorMessage(GetLasterror));
+        else LogWriteLn('## Could not get disk sector size: '+MySysErrorMessage);
       end
-      else LogWriteLn('## Could not get disk length: '+SysErrorMessage(GetLasterror));
+      else LogWriteLn('## Could not get disk length: '+MySysErrorMessage);
     finally
       CloseHandle(diskHandle);
     end;
   end
-  else LogWriteLn('## Could not open disk '+aDiskPath+': '+SysErrorMessage(GetLasterror));
+  else LogWriteLn('## Could not open disk '+aDiskPath+': '+MySysErrorMessage);
 end;
 
 const
