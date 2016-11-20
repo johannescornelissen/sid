@@ -23,6 +23,22 @@ program SmartImageDisk;
 // how to connect to master/slave pins with photo
 // http://elabz.com/repairning-seagate-7200-11-drive-on-a-ubuntu-success-story/
 
+// LBA translation https://en.wikipedia.org/wiki/Cylinder-head-sector
+
+// g-list remapping reallocation problem
+// http://forum.hddguru.com/viewtopic.php?t=6411&start=60
+
+// safe mode
+// http://www.datarecoverytools.co.uk/2011/01/29/how-to-test-seagate-drives-heads-for-hdd-repair/
+// antwoord op disable correction
+// https://forum.hddguru.com/viewtopic.php?f=1&t=29535&start=40&mobile=mobile
+
+// https://forum.hddguru.com/viewtopic.php?f=1&t=27413&start=20&mobile=mobile
+
+
+// forum hdd tools
+// http://www.hddoracle.com/viewforum.php?f=11
+
 uses
   WinApi.Windows,
   System.Math,
@@ -40,6 +56,8 @@ const
   dtOneMilliSecond = dtOneSecond/1000;
 
   MaxSaveRangesDelta = 5*dtOneMinute; // every 5 minutes
+
+  defaultMinRange = Int64(4)*1024*1024*1024; // 200 mb
 
 type
   TSTORAGE_PROPERTY_ID = (
@@ -101,19 +119,16 @@ type
     function middle(aBlockSize: Int64): Int64;
   end;
 
-  TRanges = TList<TRange>;
+  TRanges = class(TList<TRange>)
+    procedure LoadRanges(const aRangesFileName: string);
+    procedure SaveRanges(const aRangesFileName: string);
+		procedure LogRanges();
 
-{ TRange }
-
-function TRange.middle(aBlockSize: Int64): Int64;
-begin
-  Result := ((tail+head) div (2*aBlockSize))*aBlockSize;
-end;
-
-function TRange.size: Int64;
-begin
-  Result := tail-head+1;
-end;
+    procedure IncRangeHead(aRange: Integer; aIncrement: Integer);
+		procedure DecRangeTail(aRange: Integer; aDecrement: Integer);
+  	procedure SetRangeHeadScan(aRange: Integer; aScan: Boolean);
+		procedure SetRangeTailScan(aRange: Integer; aScan: Boolean);
+  end;
 
 { bytes to string }
 
@@ -187,6 +202,115 @@ begin
   WriteLn(aLine);
 end;
 
+procedure LogRange(aRange: TRange; const aPrefix: string='   ');
+begin
+  LogWriteLn(
+    aPrefix+
+    aRange.head.ToString()+' ('+Ord(aRange.scanHead).ToString+') - '+
+    aRange.tail.ToString()+' ('+Ord(aRange.scanTail).ToString+') : '+
+    BytesToStr(aRange.size));
+end;
+
+{ TRange }
+
+function TRange.middle(aBlockSize: Int64): Int64;
+begin
+  Result := ((tail+head) div (2*aBlockSize))*aBlockSize;
+end;
+
+function TRange.size: Int64;
+begin
+  Result := tail-head+1;
+end;
+
+{ TRanges }
+
+procedure TRanges.DecRangeTail(aRange, aDecrement: Integer);
+var
+  currentRange: TRange;
+begin
+  currentRange := self[aRange];
+  currentRange.tail := currentRange.tail-aDecrement;
+  self[aRange] := currentRange;
+end;
+
+procedure TRanges.IncRangeHead(aRange, aIncrement: Integer);
+var
+  currentRange: TRange;
+begin
+  currentRange := self[aRange];
+  currentRange.head := currentRange.head+aIncrement;
+  self[aRange] := currentRange;
+end;
+
+procedure TRanges.LoadRanges(const aRangesFileName: string);
+var
+  rangesFile: File;
+  currentRange: TRange;
+  res: Integer;
+begin
+  AssignFile(rangesFile, aRangesFileName);
+  Reset(rangesFile, 1);
+  try
+    while not EOF(rangesFile) do
+    begin
+      BlockRead(rangesFile, currentRange, SizeOf(currentRange), res);
+      if res=SizeOf(currentRange)
+      then Add(currentRange)
+      else
+      begin
+        LogWriteLn('## Error reading progress file..');
+        ReadLn;
+        Halt;
+      end;
+    end;
+  finally
+    CloseFile(rangesFile);
+  end;
+end;
+
+procedure TRanges.LogRanges;
+var
+  currentRange: TRange;
+begin
+  for currentRange in self
+  do LogRange(currentRange);
+end;
+
+procedure TRanges.SaveRanges(const aRangesFileName: string);
+var
+  rangesFile: File;
+  currentRange: TRange;
+begin
+  // store ranges
+  AssignFile(rangesFile, aRangesFileName);
+  Rewrite(rangesFile, 1);
+  try
+    for currentRange in self
+    do BlockWrite(rangesFile, currentRange, SizeOf(currentRange));
+  finally
+    CloseFile(rangesFile);
+  end;
+end;
+
+procedure TRanges.SetRangeHeadScan(aRange: Integer; aScan: Boolean);
+var
+  currentRange: TRange;
+begin
+  currentRange := self[aRange];
+  currentRange.scanHead := aScan;
+  self[aRange] := currentRange;
+end;
+
+procedure TRanges.SetRangeTailScan(aRange: Integer; aScan: Boolean);
+var
+  currentRange: TRange;
+begin
+  currentRange := self[aRange];
+  currentRange.scanTail := aScan;
+  self[aRange] := currentRange;
+end;
+
 function GetFileSizeEx(aFileHandle: THandle; var aFileSize: Int64): bool; stdcall; external kernelbase name 'GetFileSizeEx';
 
 function SizeOfFile(const aFilename: string): Int64;
@@ -236,6 +360,7 @@ begin
       end
       else Result := False;
     end;
+    WriteLn; // to skip progress line
   finally
     CloseFile(F);
   end;
@@ -258,12 +383,10 @@ begin
   then Result := -1;
 end;
 
-function MySysErrorMessage(): string;
-var
-  le: DWORD;
+function MySysErrorMessage(var aError: DWORD): string;
 begin
-  le := GetLastError;
-  Result := le.tostring+': '+SysErrorMessage(le);
+  aError := GetLastError;
+  Result := aError.tostring+': '+SysErrorMessage(aError);
 end;
 
 function GetDiskSectorSize(aDiskHandle: THandle): Integer;
@@ -282,7 +405,7 @@ begin
   else Result := -1;
 end;
 
-function CopyBlock(aDiskHandle, aOutputFile: THandle; {aOutputFile: TFileStream; }aPosition: Int64; aBlockSize: DWORD; var aBuffer): Boolean;
+function CopyBlock(aDiskHandle, aOutputFile: THandle; {aOutputFile: TFileStream; }aPosition: Int64; aBlockSize: DWORD; var aBuffer; var aErrorCode: DWORD): Boolean;
 var
   res: DWORD;
 begin
@@ -294,15 +417,10 @@ begin
     Result :=
       SetFilePointerEx(aOutputFile, aPosition, nil, FILE_BEGIN) and
       WriteFile(aOutputFile, aBuffer, aBlockSize, res, nil);
-    {
-    aOutputFile.Position := aPosition;
-    res := aOutputFile.Write(aBuffer, res);
-    Result := res=aBlockSize;
-    }
 	end
   else
   begin
-    LogWriteLn('## CopyBlock @ '+aPosition.ToString+' - '+BytesToStr(aBlockSize)+' : '+MySysErrorMessage);
+    LogWriteLn('## CopyBlock @ '+aPosition.ToString+' - '+BytesToStr(aBlockSize)+' : '+MySysErrorMessage(aErrorCode));
     Result := False;
   end;
 end;
@@ -329,72 +447,17 @@ begin
     #13);
 end;
 
-procedure LoadRanges(aRanges: TRanges; const aRangesFileName: string);
-var
-  rangesFile: File;
-  currentRange: TRange;
-  res: Integer;
-begin
-  AssignFile(rangesFile, aRangesFileName);
-  Reset(rangesFile, 1);
-  try
-    while not EOF(rangesFile) do
-    begin
-      BlockRead(rangesFile, currentRange, SizeOf(currentRange), res);
-      if res=SizeOf(currentRange)
-      then aRanges.Add(currentRange)
-      else
-      begin
-        LogWriteLn('## Error reading progress file..');
-        ReadLn;
-        Halt;
-      end;
-    end;
-  finally
-    CloseFile(rangesFile);
-  end;
-end;
-
-procedure SaveRanges(aRanges: TRanges; const aRangesFileName: string);
-var
-  rangesFile: File;
-  currentRange: TRange;
-begin
-  // store ranges
-  AssignFile(rangesFile, aRangesFileName);
-  Rewrite(rangesFile, 1);
-  try
-    for currentRange in aRanges
-    do BlockWrite(rangesFile, currentRange, SizeOf(currentRange));
-  finally
-    CloseFile(rangesFile);
-  end;
-end;
-
-procedure LogRanges(aRanges: TRanges);
-var
-  currentRange: TRange;
-begin
-  for currentRange in aRanges
-  do LogWriteLn('   '+
-       currentRange.head.ToString()+' ('+Ord(currentRange.scanHead).ToString+') - '+
-       currentRange.tail.ToString()+' ('+Ord(currentRange.scanTail).ToString+') : '+
-       BytesToStr(currentRange.size));
-end;
-
 var
   ranges: TRanges;
   rangesFileName: string;
-  //outputFile: TFileStream;
   outputFile: THandle;
   done: Boolean;
 
 procedure FlushAll;
 begin
   done := True;
-  //FlushFileBuffers(outputFile.Handle);
   FlushFileBuffers(outputFile);
-  SaveRanges(ranges, rangesFileName);
+  ranges.SaveRanges(rangesFileName);
 end;
 
 function ConsoleCtrlHandler(dwCtrlType: DWORD): Boolean; stdcall;
@@ -434,6 +497,46 @@ begin
   end;
 end;
 
+procedure CloseScanDisk(var aDiskhandle: THandle);
+begin
+  if aDiskHandle<>INVALID_HANDLE_VALUE then
+  begin
+    CloseHandle(aDiskhandle);
+    aDiskHandle := INVALID_HANDLE_VALUE;
+  end;
+end;
+
+function OpenScanDisk(const aDiskPath: string; var aDiskHandle: THandle): Boolean;
+begin
+  aDiskHandle := CreateFile(
+    PChar(aDiskPath), GENERIC_READ,
+    FILE_SHARE_READ or FILE_SHARE_WRITE,
+    nil,
+    OPEN_EXISTING,
+    FILE_ATTRIBUTE_NORMAL or FILE_FLAG_NO_BUFFERING,
+    0);
+  Result := aDiskHandle<>INVALID_HANDLE_VALUE;
+end;
+
+procedure WaitToReopenDisk(const aDiskPath: string; var aDiskHandle: THandle);
+var
+  p: Char;
+begin
+  CloseScanDisk(aDiskHandle);
+  LogWriteLn('Closed scan disk');
+  p := '-';
+  while not OpenScanDisk(aDiskPath, aDiskHandle) do
+  begin
+    if p='-' then p := '\' else if p='\' then p := '|' else if p='|' then p := '/' else p := '-';
+    // log status to console only
+    Write('Waiting for scan disk '+p+#13);
+    Sleep(5*1000);
+  end;
+  WriteLn; // to skip progress line
+  Sleep(10000); // extra sleep to make stopping code possible..
+  LogWriteLn('Re-opened scan disk');
+end;
+
 procedure CopyDiskToImage(const aDiskPath, aOutputFileName, aProgressFileName: string; aMinRangeSize: Int64);
 var
   diskHandle: THandle;
@@ -445,21 +548,15 @@ var
   lowRange: TRange;
   highRange: TRange;
   blockSize: Int64;
-  maxBlockSize: Integer;
+  maxBlockSizeForward: Integer;
+  maxBlockSizeBackward: Integer;
   buffer: RawByteString;
   currentRange: TRange;
   lastSavedRanges: TDateTime;
+  errorCode: DWORD;
 begin
   // open disk as file
-  diskHandle := CreateFile(
-    PChar(aDiskPath), GENERIC_READ,
-    FILE_SHARE_READ or FILE_SHARE_WRITE,
-    nil,
-    OPEN_EXISTING,
-    FILE_ATTRIBUTE_NORMAL or FILE_FLAG_NO_BUFFERING,
-    0);
-  // FILE_FLAG_NO_BUFFERING ?
-  if diskHandle<>INVALID_HANDLE_VALUE then
+  if OpenScanDisk(aDiskPath, diskHandle) then
   begin
     try
       // get size of disk
@@ -494,9 +591,9 @@ begin
               if FileExists(aProgressFileName) then
               begin
                 // read progress file and start from there
-                LoadRanges(ranges, aProgressFileName);
+                ranges.LoadRanges(aProgressFileName);
                 LogWriteLn('Read '+ranges.Count.ToString()+' ranges to process');
-                LogRanges(ranges);
+                ranges.LogRanges();
               end
               else
               begin
@@ -509,7 +606,6 @@ begin
                 LogWriteLn('Added whole disk as first range');
               end;
 
-              //outputFile := TFileStream.Create(aOutputFileName, fmOpenReadWrite);
               outputFile := CreateFile(
     					  PChar(aOutputFileName), GENERIC_WRITE,
                 FILE_SHARE_READ or FILE_SHARE_WRITE,
@@ -519,8 +615,9 @@ begin
                 0);
               try
                 // prepare buffer
-                maxBlockSize := 64*1024; // 256*sectorSize; //*1024; // 256*4kB sectors or 2048*512B sectors
-                setLength(buffer, maxBlockSize);
+                maxBlockSizeForward := 64*1024; // 256*sectorSize; //*1024; // 256*4kB sectors or 2048*512B sectors
+                maxBlockSizeBackward := 64*1024; // sectorSize;
+                setLength(buffer, max(maxBlockSizeForward, maxBlockSizeBackward));
                 // process defined ranges
                 done := False;
                 lastSavedRanges := 0; // never saved ranges
@@ -537,64 +634,66 @@ begin
                     if r<ranges.Count then
                     begin
                       // process range
-                      try
-                        // try to advance head
-                        blockSize := sectorSize;
-                        while (ranges[r].size>0) and ranges[r].scanHead do
+                      LogRange(ranges[r], '   Processing: ');
+                      // try to advance head
+                      blockSize := sectorSize;
+                      while (ranges[r].size>0) and ranges[r].scanHead and not done do
+                      begin
+                        blockSize := min(min(blockSize, ranges[r].size), maxBlockSizeForward);
+                        ShowStatus(diskSize, ranges, r, aMinRangeSize, blockSize);
+                        errorCode := 0;
+                        if CopyBlock(diskHandle, outputFile, ranges[r].head, blockSize, buffer[1], errorCode) then
                         begin
-                          blockSize := min(min(blockSize, ranges[r].size), maxBlockSize);
-                          ShowStatus(diskSize, ranges, r, aMinRangeSize, blockSize);
-                          if CopyBlock(diskHandle, outputFile, ranges[r].head, blockSize, buffer[1]) then
-                          begin
-                            currentRange := ranges[r];
-                            currentRange.head := currentRange.head+blockSize;
-                            ranges[r] := currentRange;
-                            blockSize := blockSize*BlockGrowFactor;
-                          end
-                          else
+                          ranges.IncRangeHead(r, blockSize); // go forward
+                          blockSize := blockSize*BlockGrowFactor;
+                        end
+                        else
+                        begin
+                          if (errorCode<>483) and (errorCode<>1117) and (errorCode<>2) then
                           begin
                             if blockSize>sectorSize
                             then blockSize := sectorSize // reset block size
-                            else
-                            begin
-                              currentRange := ranges[r];
-                              currentRange.scanHead := False; //  signal we are ready
-                              ranges[r] := currentRange;
-                            end;
-                          end;
-                        end;
-                        // try to decrease tail
-                        blockSize := sectorSize;
-                        while (ranges[r].size>0) and ranges[r].scanTail do
-                        begin
-                          blockSize := min(min(blockSize, ranges[r].size), maxBlockSize);
-                          ShowStatus(diskSize, ranges, r, aMinRangeSize, blockSize);
-                          if CopyBlock(diskHandle, outputFile, ranges[r].tail-blockSize+1, blockSize, buffer[1]) then
-                          begin
-                            currentRange := ranges[r];
-                            currentRange.tail := currentRange.tail-blockSize;
-                            ranges[r] := currentRange;
-                            blockSize := blockSize*BlockGrowFactor;
+                            else ranges.SetRangeHeadScan(r, False); //  signal we are ready
                           end
                           else
                           begin
-                            if blockSize>sectorSize
-                            then blockSize := sectorSize // reset block size
-                            else
-                            begin
-                              currentRange := ranges[r];
-                              currentRange.scanTail := False; //  signal we are ready
-                              ranges[r] := currentRange;
-                            end;
+                            blockSize := sectorSize;
+                            ranges.SetRangeHeadScan(r, False); //  signal we are ready
+//                            WaitToReopenDisk(aDiskPath, diskHandle); // wait until we can re-open drive
+                            done := True; // most of the time the best decision
                           end;
-                        end;
-                      except
-                        on E: Exception do
-                        begin
-                          LogWriteLn('## Exception in copy range: '+E.Message);
-                          done := True;
                         end;
                       end;
+                      // try to decrease tail
+                      blockSize := sectorSize;
+                      while (ranges[r].size>0) and ranges[r].scanTail and not done do
+                      begin
+                        blockSize := min(min(blockSize, ranges[r].size), maxBlockSizeBackward);
+                        ShowStatus(diskSize, ranges, r, aMinRangeSize, blockSize);
+                        errorCode := 0;
+                        if CopyBlock(diskHandle, outputFile, ranges[r].tail-blockSize+1, blockSize, buffer[1], errorCode) then
+                        begin
+                          ranges.DecRangeTail(r, blockSize); // go backward
+                          blockSize := blockSize*BlockGrowFactor;
+                        end
+                        else
+                        begin
+                          if (errorCode<>483) and (errorCode<>1117) and (errorCode<>2) then
+                          begin
+                            if blockSize>sectorSize
+                            then blockSize := sectorSize // reset block size
+                            else ranges.SetRangeTailScan(r, False); //  signal we are ready
+                          end
+                          else
+                          begin
+                            blockSize := sectorSize;
+                            ranges.SetRangeTailScan(r, False); //  signal we are ready
+//                            WaitToReopenDisk(aDiskPath, diskHandle); // wait until we can re-open drive
+                            done := True; // most of the time the best decision
+                          end;
+                        end;
+                      end;
+
                       // range is minimized now
                       if ranges[r].size>0 then
                       begin
@@ -608,60 +707,62 @@ begin
                         highRange.tail := ranges[r].tail;
                         highRange.scanTail := ranges[r].scanTail;
                         // add split entries to end of queue
+                        LogRange(lowRange, '   New low: ');
+                        LogRange(highRange, '   New high: ');
                         ranges.Add(lowRange);
                         ranges.Add(highRange);
                       end;
                       // remove this entry
+                      LogRange(ranges[r], '   Removed: ');
                       ranges.Delete(r);
                     end
                     else done := True;
 
+                    // save progress
                     if lastSavedRanges<=Now-MaxSaveRangesDelta then
                     begin
-                      SaveRanges(ranges, aProgressFileName);
+                      ranges.SaveRanges(aProgressFileName);
                       lastSavedRanges := Now;
                     end;
 
-                  end;
+                  end; // end of main scan loop
+
                 finally
                   SetConsoleCtrlHandler(@ConsoleCtrlHandler, False);
                 end;
 
               finally
-                //outputFile.Free;
                 CloseHandle(outputFile);
               end;
 
               WriteLn; // to skip progress line
 
-              SaveRanges(ranges, aProgressFileName);
+              ranges.SaveRanges(aProgressFileName);
 
               LogWriteLn('Saved '+ranges.Count.ToString()+' ranges');
 
               for currentRange in ranges
-              do LogFileOnlyWriteLn(currentRange.head.ToString+#9+currentRange.tail.ToString+#9+BytesToStr(currentRange.size));
+              do LogFileOnlyWriteLn(currentRange.head.ToString+#9+Ord(currentRange.scanHead).ToString+#9+currentRange.tail.ToString+#9+Ord(currentRange.scanTail).ToString+#9+BytesToStr(currentRange.size));
 
             finally
               ranges.Free;
             end;
           end;
         end
-        else LogWriteLn('## Could not get disk sector size: '+MySysErrorMessage);
+        else LogWriteLn('## Could not get disk sector size: '+MySysErrorMessage(errorCode));
       end
-      else LogWriteLn('## Could not get disk length: '+MySysErrorMessage);
+      else LogWriteLn('## Could not get disk length: '+MySysErrorMessage(errorCode));
     finally
-      CloseHandle(diskHandle);
+      CloseScanDisk(diskHandle);
     end;
   end
-  else LogWriteLn('## Could not open disk '+aDiskPath+': '+MySysErrorMessage);
+  else LogWriteLn('## Could not open disk '+aDiskPath+': '+MySysErrorMessage(errorCode));
 end;
 
-const
-  defaultMinRange = 1024*1024;
 var
   diskPath: string;
   imageFileName: string;
-  minRange: Integer;
+  minRange: Int64;
 begin
   try
     if ParamCount=0 then
@@ -676,7 +777,7 @@ begin
       then imageFileName := ParamStr(2)
       else imageFileName := ChangeFileExt(ParamStr(0), '.dsk');
       if ParamCount>2
-      then minRange := StrToIntDef(ParamStr(3), defaultMinRange)
+      then minRange := StrToInt64Def(ParamStr(3), defaultMinRange)
       else minRange := defaultMinRange;
 
       OpenLog(ChangeFileExt(imageFileName, '.log'));

@@ -1,0 +1,48 @@
+﻿<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+    <PropertyGroup>
+        <ProjectGuid>{8DFC1594-B127-4DD5-9C41-45B78198A199}</ProjectGuid>
+    </PropertyGroup>
+    <ItemGroup>
+        <Projects Include="SmartImageDisk.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="sidRangeScan.dproj">
+            <Dependencies/>
+        </Projects>
+    </ItemGroup>
+    <ProjectExtensions>
+        <Borland.Personality>Default.Personality.12</Borland.Personality>
+        <Borland.ProjectType/>
+        <BorlandProject>
+            <Default.Personality/>
+        </BorlandProject>
+    </ProjectExtensions>
+    <Target Name="SmartImageDisk">
+        <MSBuild Projects="SmartImageDisk.dproj"/>
+    </Target>
+    <Target Name="SmartImageDisk:Clean">
+        <MSBuild Projects="SmartImageDisk.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="SmartImageDisk:Make">
+        <MSBuild Projects="SmartImageDisk.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="sidRangeScan">
+        <MSBuild Projects="sidRangeScan.dproj"/>
+    </Target>
+    <Target Name="sidRangeScan:Clean">
+        <MSBuild Projects="sidRangeScan.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="sidRangeScan:Make">
+        <MSBuild Projects="sidRangeScan.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="Build">
+        <CallTarget Targets="SmartImageDisk;sidRangeScan"/>
+    </Target>
+    <Target Name="Clean">
+        <CallTarget Targets="SmartImageDisk:Clean;sidRangeScan:Clean"/>
+    </Target>
+    <Target Name="Make">
+        <CallTarget Targets="SmartImageDisk:Make;sidRangeScan:Make"/>
+    </Target>
+    <Import Project="$(BDS)\Bin\CodeGear.Group.Targets" Condition="Exists('$(BDS)\Bin\CodeGear.Group.Targets')"/>
+</Project>
